@@ -1,6 +1,6 @@
 {
   "name": "@openverduurzamen/tenant-runtime",
-  "version": "v1.1.0",
+  "version": "1.2.0",
   "description": "Shared runtime for OpenVerduurzamen tenant apps (checkout, payment, mail, PDF delivery). One tenant per Render service.",
   "private": true,
   "type": "module",
