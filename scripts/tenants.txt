@@ -1,0 +1,3 @@
+# One git URL per line. Add a new line per tenant. Comments with # ignored.
+git@github.com:OpenVerduurzamen/tenant-woonwijzerwinkel.git
+git@github.com:OpenVerduurzamen/tenant-huislijn.git

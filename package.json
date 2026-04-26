@@ -1,0 +1,26 @@
+{
+  "name": "@openverduurzamen/tenant-runtime",
+  "version": "1.0.0",
+  "description": "Shared runtime for OpenVerduurzamen tenant apps (checkout, payment, mail, PDF delivery). One tenant per Render service.",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./lib/*": "./lib/*"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "index.js",
+    "lib/",
+    "templates/",
+    "README.md"
+  ],
+  "dependencies": {
+    "express": "^4.21.2",
+    "resend": "^4.0.1",
+    "undici": "^6.21.0"
+  }
+}
