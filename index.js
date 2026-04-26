@@ -574,27 +574,35 @@ export function createTenantApp(config) {
   app.post("/api/mid/stream", async (req, res) => {
     const renderUrl = getReportRenderUrl();
     if (!renderUrl) return res.status(500).json({ error: "FULL_APP_RENDER_URL ontbreekt." });
-    // Derive the report-api stream URL from the render URL. The render
-    // URL ends in /api/full/render; the stream is at /api/mid/stream on
-    // the same host.
     const upstream = renderUrl.replace(/\/api\/full\/render$/i, "/api/mid/stream");
-
-    // The frontend posts a JSON body with address + confirmed_data + flags.
-    // We forward verbatim plus the brand object (so the LLM prompts get
-    // the tenant's substitutions) and the shared API key.
     const upstreamBody = JSON.stringify({ ...(req.body || {}), tenant: buildBrandPayload() });
 
-    // SSE headers downstream — must flush immediately, no buffering.
+    // SSE response headers. Note: we do NOT set Connection: keep-alive
+    // here — it's an HTTP/1.1 directive that's invalid in HTTP/2 (which
+    // is what Render+Cloudflare actually use), and adding it can cause
+    // the proxy layer to behave unpredictably. Cache-Control: no-cache
+    // already prevents intermediary buffering.
     res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-transform");
-    res.setHeader("Connection", "keep-alive");
-    res.setHeader("X-Accel-Buffering", "no"); // some proxies buffer SSE without this
-    res.flushHeaders?.();
+    res.setHeader("X-Accel-Buffering", "no");
+
+    // We DON'T flushHeaders() here. It seemed like a good idea but on
+    // Render's HTTP/2 proxy stack, flushing headers before any body byte
+    // has been generated triggers a premature client-close event under
+    // some conditions. Express will flush automatically when we write
+    // the first chunk, which is fine for SSE.
 
     const ac = new AbortController();
-    // If the browser disconnects, abort the upstream too so we don't keep
-    // the OpenAI generation running uselessly.
-    req.on("close", () => { try { ac.abort(); } catch {} });
+    let upstreamStarted = false;
+
+    // Wire client-disconnect abort, but ONLY after we've successfully
+    // received headers from upstream and started piping. The earlier
+    // version registered this handler before the upstream fetch even
+    // started, which on some Node versions caused the abort to fire as
+    // soon as any header-flush happened on the response — within 4ms,
+    // before any real data could arrive.
+    const onClientClose = () => { if (upstreamStarted) { try { ac.abort(); } catch {} } };
+    res.on("close", onClientClose);
 
     try {
       const upstreamRes = await undiciFetch(upstream, {
@@ -607,24 +615,31 @@ export function createTenantApp(config) {
 
       if (!upstreamRes.ok || !upstreamRes.body) {
         const text = await upstreamRes.text().catch(() => "");
-        // SSE: emit a single error event so the frontend's onerror handler
-        // can show a useful message instead of a generic disconnect.
         res.write(`event: error\ndata: ${JSON.stringify({ status: upstreamRes.status, message: text || "stream upstream error" })}\n\n`);
         return res.end();
       }
 
-      // Pipe upstream bytes straight through. The Web ReadableStream
-      // returned by undici can be drained with for-await-of.
+      // Now that upstream is connected, allow client-disconnect to
+      // propagate as an abort (so we don't keep the OpenAI generation
+      // running uselessly when the user navigates away).
+      upstreamStarted = true;
+
       for await (const chunk of upstreamRes.body) {
         if (res.writableEnded) break;
         res.write(chunk);
       }
       res.end();
     } catch (e) {
-      try {
-        res.write(`event: error\ndata: ${JSON.stringify({ message: e?.message || String(e) })}\n\n`);
-      } catch {}
+      // Don't surface "operation aborted" as a user-facing error if it
+      // was caused by the client itself disconnecting cleanly.
+      const msg = e?.message || String(e);
+      const isClientAbort = ac.signal.aborted && upstreamStarted;
+      if (!isClientAbort) {
+        try { res.write(`event: error\ndata: ${JSON.stringify({ message: msg })}\n\n`); } catch {}
+      }
       try { res.end(); } catch {}
+    } finally {
+      res.off("close", onClientClose);
     }
   });
 
