@@ -51,14 +51,14 @@ while IFS= read -r repo; do
   fi
 
   # Update the runtime pin. We rely on a sentinel string in package.json:
-  # "@openverduurzamen/tenant-runtime": "github:OpenVerduurzamen/tenant-runtime#vX.Y.Z"
+  # "@openverduurzamen/tenant-runtime": "git+https://github.com/snowy-warmy/Openverduurzamen_tenant_runtime.git#vX.Y.Z"
   if ! grep -q '"@openverduurzamen/tenant-runtime"' "$REPO_DIR/package.json"; then
     echo "  ! no tenant-runtime dep in package.json; skipping"
     continue
   fi
 
   sed -i.bak -E \
-    "s|(\"@openverduurzamen/tenant-runtime\"\s*:\s*\"github:OpenVerduurzamen/tenant-runtime#)v[0-9.]+\"|\\1${VERSION}\"|" \
+    "s|(\"@openverduurzamen/tenant-runtime\"\s*:\s*\"git\+https://github\.com/snowy-warmy/Openverduurzamen_tenant_runtime\.git#)v[0-9.]+\"|\\1${VERSION}\"|" \
     "$REPO_DIR/package.json"
   rm -f "$REPO_DIR/package.json.bak"
 
