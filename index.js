@@ -161,6 +161,11 @@ export function createTenantApp(config) {
     fullDone:     readFileIfExists(path.join(templatesDir, "full_done.html")),
     terms:        readFileIfExists(path.join(templatesDir, "algemene-voorwaarden.html")),
     email:        readFileIfExists(path.join(templatesDir, "email.html")),
+    // Mid landing page — the free short report. When present, becomes
+    // the default landing route at "/". Tenants who don't want a Mid
+    // funnel just don't ship this template; "/" then falls through to
+    // /full_start.html as before.
+    midStart:     readFileIfExists(path.join(templatesDir, "mid_start.html")),
   };
 
   // Storage paths
@@ -494,7 +499,15 @@ export function createTenantApp(config) {
     res.type("text/html; charset=utf-8").send(html);
   }
 
-  app.get("/", (_req, res) => res.redirect("/full_start.html"));
+  // Root route: when this tenant ships a mid_start.html, serve it as the
+  // default landing page (the free Mid report is the funnel entry; full
+  // report sells from the bottom of it). Tenants without a Mid template
+  // get redirected straight to /full_start.html as before.
+  app.get("/", (req, res) => {
+    if (templates.midStart) return serveTemplatedPage(req, res, "midStart", "Pagina niet beschikbaar.");
+    return res.redirect("/full_start.html");
+  });
+  app.get("/mid_start.html", (req, res) => serveTemplatedPage(req, res, "midStart", "Mid-rapport niet beschikbaar voor deze tenant."));
   app.get("/full_start.html", (req, res) => serveTemplatedPage(req, res, "fullStart", "Pagina niet beschikbaar."));
   app.get("/full_done.html",  (req, res) => serveTemplatedPage(req, res, "fullDone",  "Pagina niet beschikbaar."));
   app.get("/algemene-voorwaarden.html", (req, res) => serveTemplatedPage(req, res, "terms", "Algemene voorwaarden niet beschikbaar."));
@@ -527,6 +540,110 @@ export function createTenantApp(config) {
       const lookup = await fetchLookupFromReportApi(address);
       return res.json(lookup);
     } catch (e) { return res.status(500).json({ error: e?.message || String(e) }); }
+  });
+
+  // -------------------------------------------------------------------------
+  // Mid: free short report flow
+  //
+  // The user-facing pages live at /mid_start.html (and / when present).
+  // The frontend (mid_app.js) POSTs to these three endpoints. Each one
+  // proxies through to the report-api so the tenant brand and shared
+  // x-api-key stay consistent and the user's browser never talks to
+  // report-api directly.
+  // -------------------------------------------------------------------------
+
+  // Address lookup. Identical contract to /api/full/lookup-address — the
+  // old Mid frontend just calls a different path. Kept as a separate
+  // route so no frontend changes are needed.
+  app.post("/api/mid/lookup", async (req, res) => {
+    try {
+      const address = normalizeAddressInput(req.body || {});
+      if (!address.postalcode || !address.housenumber) {
+        return res.status(400).json({ error: "postalcode en housenumber zijn verplicht." });
+      }
+      const lookup = await fetchLookupFromReportApi(address);
+      return res.json(lookup);
+    } catch (e) { return res.status(500).json({ error: e?.message || String(e) }); }
+  });
+
+  // Mid streaming (SSE). The report-api takes ~30-90s to write the short
+  // report and emits incremental events along the way. We forward the
+  // raw byte stream so the browser's EventSource sees the same events.
+  // Auth and tenant branding are added on the way out; everything coming
+  // back is just piped.
+  app.post("/api/mid/stream", async (req, res) => {
+    const renderUrl = getReportRenderUrl();
+    if (!renderUrl) return res.status(500).json({ error: "FULL_APP_RENDER_URL ontbreekt." });
+    // Derive the report-api stream URL from the render URL. The render
+    // URL ends in /api/full/render; the stream is at /api/mid/stream on
+    // the same host.
+    const upstream = renderUrl.replace(/\/api\/full\/render$/i, "/api/mid/stream");
+
+    // The frontend posts a JSON body with address + confirmed_data + flags.
+    // We forward verbatim plus the brand object (so the LLM prompts get
+    // the tenant's substitutions) and the shared API key.
+    const upstreamBody = JSON.stringify({ ...(req.body || {}), tenant: buildBrandPayload() });
+
+    // SSE headers downstream — must flush immediately, no buffering.
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no"); // some proxies buffer SSE without this
+    res.flushHeaders?.();
+
+    const ac = new AbortController();
+    // If the browser disconnects, abort the upstream too so we don't keep
+    // the OpenAI generation running uselessly.
+    req.on("close", () => { try { ac.abort(); } catch {} });
+
+    try {
+      const upstreamRes = await undiciFetch(upstream, {
+        method: "POST",
+        headers: { ...buildReportApiHeaders(), Accept: "text/event-stream" },
+        body: upstreamBody,
+        signal: ac.signal,
+        dispatcher: longFetchAgent,
+      });
+
+      if (!upstreamRes.ok || !upstreamRes.body) {
+        const text = await upstreamRes.text().catch(() => "");
+        // SSE: emit a single error event so the frontend's onerror handler
+        // can show a useful message instead of a generic disconnect.
+        res.write(`event: error\ndata: ${JSON.stringify({ status: upstreamRes.status, message: text || "stream upstream error" })}\n\n`);
+        return res.end();
+      }
+
+      // Pipe upstream bytes straight through. The Web ReadableStream
+      // returned by undici can be drained with for-await-of.
+      for await (const chunk of upstreamRes.body) {
+        if (res.writableEnded) break;
+        res.write(chunk);
+      }
+      res.end();
+    } catch (e) {
+      try {
+        res.write(`event: error\ndata: ${JSON.stringify({ message: e?.message || String(e) })}\n\n`);
+      } catch {}
+      try { res.end(); } catch {}
+    }
+  });
+
+  // Mid → Full handoff. Internal alias: same logic as /api/full/handoff,
+  // but exposed under the path the legacy Mid frontend hardcoded. Skips
+  // requireHandoffKey because this route is called by the user's browser
+  // (same-origin), not by a server.
+  app.post("/api/mid/full-report-handoff", handleMidHandoff);
+
+  // Mid handoff config — old Mid frontend hits this on init to learn
+  // where to send the user. In the merged tenant world, the answer is
+  // always "this very server", so we return self-referential URLs.
+  app.get("/api/mid/full-handoff-config", (req, res) => {
+    const baseUrl = getBaseUrl(req);
+    return res.json({
+      public_url: baseUrl,
+      handoff_candidates: [`${baseUrl}/api/mid/full-report-handoff`],
+      has_api_key: false, // browser-side calls don't need a key
+    });
   });
 
   // Mid → tenant handoff. The Mid frontend POSTs confirmed_data here;
