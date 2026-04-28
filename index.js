@@ -456,7 +456,7 @@ export function createTenantApp(config) {
 
       try {
         appendStep(orderId, "mail_started", { to: order.email });
-        await sendReportEmail({ to: order.email, orderId: order.id, pdfBuffer, filename, config, emailTemplate: templates.email });
+        await sendReportEmail({ to: order.email, orderId: order.id, pdfBuffer, filename, config, emailTemplate: templates.email, address: order.address });
       } catch (mailErr) {
         order = updateOrder(orderId, { status: "mail_failed", processing_lock: false, last_step: "mail_failed", render_debug: mailErr?.context || null, error: mailErr?.message || String(mailErr) });
         appendStep(orderId, "mail_failed", { message: mailErr?.message || String(mailErr) });
