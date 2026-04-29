@@ -693,6 +693,16 @@ export function createTenantApp(config) {
     return serveTemplatedPage(req, res, "internLogin", "Interne login niet beschikbaar voor deze tenant.");
   });
 
+  // Common-typo aliases — different staff members try slightly different
+  // URLs on first login, so we fold them all back to /intern. No magic
+  // logic, just redirects.
+  app.get("/intern/", (req, res) => res.redirect("/intern"));
+  app.get("/intern.html", (req, res) => res.redirect("/intern"));
+  app.get("/intern-login", (req, res) => res.redirect("/intern"));
+  app.get("/intern-login.html", (req, res) => res.redirect("/intern"));
+  app.get("/intern/login", (req, res) => res.redirect("/intern"));
+  app.get("/intern/login.html", (req, res) => res.redirect("/intern"));
+
   app.get("/intern/full_start.html", requireInternalSession, (req, res) =>
     serveTemplatedPage(req, res, "internFullStart", "Interne pagina niet beschikbaar voor deze tenant.")
   );
