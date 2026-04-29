@@ -564,6 +564,65 @@ export function createTenantApp(config) {
     for (const order of candidates) triggerBackgroundProcessing(order.id);
   }
 
+  // PDF retention cleanup. Walks every order, deletes the PDF file
+  // for any order whose mailed_at is older than PDF_RETENTION_DAYS
+  // (default 365), and marks the order so the download route can
+  // explain "this report has expired" instead of returning a bare
+  // 404. The order JSON itself is kept indefinitely — it's tiny and
+  // useful for support/debugging.
+  function cleanupExpiredPdfs() {
+    const retentionDays = Number(process.env.PDF_RETENTION_DAYS || 365);
+    if (!Number.isFinite(retentionDays) || retentionDays <= 0) return;
+    const cutoffMs = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+
+    // Pull a generous slice — at WWW volume (a handful of orders per
+    // day) we'd hit 10,000 only after ~10 years, well past any
+    // retention window.
+    const orders = listOrders(10000);
+    let removed = 0;
+    let errors = 0;
+    for (const order of orders) {
+      if (order.pdf_deleted_at) continue;
+      if (!order.download_path) continue;
+      // We use mailed_at as the anchor — that's when the customer
+      // received the link. If for some reason mailed_at is missing,
+      // fall back to created_at so we still clean up eventually.
+      const anchor = order.mailed_at || order.created_at;
+      if (!anchor) continue;
+      const anchorMs = Date.parse(anchor);
+      if (!Number.isFinite(anchorMs) || anchorMs > cutoffMs) continue;
+
+      try {
+        if (fs.existsSync(order.download_path)) {
+          fs.unlinkSync(order.download_path);
+        }
+        updateOrder(order.id, {
+          pdf_deleted_at: nowIso(),
+          // We deliberately leave download_path / pdf_filename in
+          // place — they're useful as an audit trail of what the
+          // file was named when it existed.
+        });
+        removed++;
+      } catch (err) {
+        errors++;
+        console.error(`PDF retention cleanup failed for order ${order.id}:`, err?.message || err);
+      }
+    }
+    if (removed > 0 || errors > 0) {
+      console.log(`PDF retention cleanup: removed=${removed} errors=${errors} retention=${retentionDays}d`);
+    }
+  }
+
+  // Run cleanup once on boot, then every 24h. Render restarts the
+  // service occasionally, so on-boot guarantees we don't drift past
+  // retention even if the 24h timer never fires.
+  function scheduleCleanup() {
+    try { cleanupExpiredPdfs(); } catch (err) { console.error("cleanup error", err); }
+    setInterval(() => {
+      try { cleanupExpiredPdfs(); } catch (err) { console.error("cleanup error", err); }
+    }, 24 * 60 * 60 * 1000);
+  }
+
   async function processOrderById(orderId) {
     let order = getOrderById(orderId);
     if (!order) throw new Error("Order niet gevonden.");
@@ -619,7 +678,30 @@ export function createTenantApp(config) {
 
       try {
         appendStep(orderId, "mail_started", { to: order.email });
-        await sendReportEmail({ to: order.email, orderId: order.id, pdfBuffer, filename, config, emailTemplate: templates.email });
+        // Build the public download URL using APP_BASE_URL. When it's
+        // not configured we pass an empty string and the email template
+        // omits the "view online" line. The link points at the short
+        // /r/:id alias, which validates the token and streams the PDF.
+        const baseUrlConfigured = String(process.env.APP_BASE_URL || "").trim().replace(/\/$/, "");
+        const downloadUrl = baseUrlConfigured && order.download_token
+          ? `${baseUrlConfigured}/r/${order.id}?t=${order.download_token}`
+          : "";
+        // Build a human-readable address line from whatever fields are
+        // present. Tenants can use {{ADDRESS}} in their email template.
+        const addressLine = order.address?.addr_line
+          || [order.address?.postalcode, order.address?.housenumber, order.address?.houseaddition]
+              .filter(Boolean).join(" ").trim()
+          || "";
+        await sendReportEmail({
+          to: order.email,
+          orderId: order.id,
+          pdfBuffer,
+          filename,
+          config,
+          emailTemplate: templates.email,
+          downloadUrl,
+          addressLine,
+        });
       } catch (mailErr) {
         order = updateOrder(orderId, { status: "mail_failed", processing_lock: false, last_step: "mail_failed", render_debug: mailErr?.context || null, error: mailErr?.message || String(mailErr) });
         appendStep(orderId, "mail_failed", { message: mailErr?.message || String(mailErr) });
@@ -1116,14 +1198,42 @@ export function createTenantApp(config) {
     return res.json(buildOrderPublicView(order));
   });
 
+  // Public download — the long form. Kept for backwards compatibility with
+  // any link that's already in the wild. New links use the /r/:id short
+  // alias below.
   app.get("/api/full/order/:id/download", (req, res) => {
+    return serveOrderDownload(req, res, String(req.query?.token || "").trim());
+  });
+
+  // Short public download URL — what we put in emails now. Same auth
+  // (token via ?t=...) and same file streaming as the long form.
+  app.get("/r/:id", (req, res) => {
+    return serveOrderDownload(req, res, String(req.query?.t || "").trim());
+  });
+
+  function serveOrderDownload(req, res, token) {
     const order = getOrderById(String(req.params.id || ""));
     if (!order) return res.status(404).send("Order niet gevonden.");
-    const token = String(req.query?.token || "").trim();
     if (!token || token !== order.download_token) return res.status(401).send("Unauthorized");
+    // After retention cleanup the file is gone but the order row stays
+    // (with pdf_deleted_at set) so we can give a meaningful response
+    // instead of a bare 404.
+    if (order.pdf_deleted_at) {
+      const days = Number(process.env.PDF_RETENTION_DAYS || 365);
+      // order.id is a hex string from crypto.randomBytes — safe to
+      // interpolate without HTML-escaping.
+      return res.status(410).type("text/html").send(
+        `<!doctype html><html lang="nl"><meta charset="utf-8"><title>Rapport verlopen</title>` +
+        `<body style="font-family:system-ui,sans-serif;max-width:560px;margin:60px auto;padding:0 18px;color:#0f172a;line-height:1.5;">` +
+        `<h1 style="font-size:22px;margin:0 0 10px;">Dit rapport is niet meer beschikbaar</h1>` +
+        `<p>Rapporten worden ${days} dagen bewaard en zijn daarna automatisch van onze servers verwijderd. Wel staat de PDF nog in de oorspronkelijke e-mail die u heeft ontvangen.</p>` +
+        `<p style="color:#64748b;font-size:13px;">Order: ${order.id}</p>` +
+        `</body></html>`
+      );
+    }
     if (!order.download_path || !fs.existsSync(order.download_path)) return res.status(404).send("PDF niet gevonden.");
     return res.download(order.download_path, order.pdf_filename || `${order.id}.pdf`);
-  });
+  }
 
   app.get("/api/admin/orders", requireAdminKey, (_req, res) => {
     return res.json({ orders: listOrders(200).map(buildOrderPublicView).slice(0, 100) });
@@ -1139,6 +1249,10 @@ export function createTenantApp(config) {
   setTimeout(() => recoverPendingOrders().catch(() => {}), 1000);
   const intervalMs = Number(process.env.RETRY_INTERVAL_MS || 60000);
   setInterval(() => { recoverPendingOrders().catch(() => {}); }, intervalMs);
+
+  // PDF retention cleanup runs daily (and once on boot). Set
+  // PDF_RETENTION_DAYS=0 to disable. Default 365.
+  scheduleCleanup();
 
   console.log(`[tenant-runtime] Tenant '${config.id}' (${config.brand?.name || ""}) ready.`);
   return app;
