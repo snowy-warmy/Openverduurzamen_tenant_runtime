@@ -166,6 +166,12 @@ export function createTenantApp(config) {
     // funnel just don't ship this template; "/" then falls through to
     // /full_start.html as before.
     midStart:     readFileIfExists(path.join(templatesDir, "mid_start.html")),
+    // Onepager landing page — the single-A4-summary flow. When present,
+    // takes precedence over Mid/Full at "/". This is what the
+    // Energiepresatie tenant ships. The page POSTs to
+    // /api/onepager/render and renders the returned html_fragment
+    // inline (see the runtime's onepager proxy further down).
+    onepagerStart: readFileIfExists(path.join(templatesDir, "onepager_start.html")),
   };
 
   // Storage paths
@@ -456,7 +462,7 @@ export function createTenantApp(config) {
 
       try {
         appendStep(orderId, "mail_started", { to: order.email });
-        await sendReportEmail({ to: order.email, orderId: order.id, pdfBuffer, filename, config, emailTemplate: templates.email, address: order.address });
+        await sendReportEmail({ to: order.email, orderId: order.id, pdfBuffer, filename, config, emailTemplate: templates.email });
       } catch (mailErr) {
         order = updateOrder(orderId, { status: "mail_failed", processing_lock: false, last_step: "mail_failed", render_debug: mailErr?.context || null, error: mailErr?.message || String(mailErr) });
         appendStep(orderId, "mail_failed", { message: mailErr?.message || String(mailErr) });
@@ -499,14 +505,14 @@ export function createTenantApp(config) {
     res.type("text/html; charset=utf-8").send(html);
   }
 
-  // Root route: when this tenant ships a mid_start.html, serve it as the
-  // default landing page (the free Mid report is the funnel entry; full
-  // report sells from the bottom of it). Tenants without a Mid template
-  // get redirected straight to /full_start.html as before.
+  // Root route: precedence is onepagerStart → midStart → fullStart. The
+  // first template the tenant ships becomes the landing page.
   app.get("/", (req, res) => {
+    if (templates.onepagerStart) return serveTemplatedPage(req, res, "onepagerStart", "Pagina niet beschikbaar.");
     if (templates.midStart) return serveTemplatedPage(req, res, "midStart", "Pagina niet beschikbaar.");
     return res.redirect("/full_start.html");
   });
+  app.get("/onepager_start.html", (req, res) => serveTemplatedPage(req, res, "onepagerStart", "Onepager niet beschikbaar voor deze tenant."));
   app.get("/mid_start.html", (req, res) => serveTemplatedPage(req, res, "midStart", "Mid-rapport niet beschikbaar voor deze tenant."));
   app.get("/full_start.html", (req, res) => serveTemplatedPage(req, res, "fullStart", "Pagina niet beschikbaar."));
   app.get("/full_done.html",  (req, res) => serveTemplatedPage(req, res, "fullDone",  "Pagina niet beschikbaar."));
@@ -640,6 +646,51 @@ export function createTenantApp(config) {
       try { res.end(); } catch {}
     } finally {
       res.off("close", onClientClose);
+    }
+  });
+
+  // Onepager render proxy. The report-api does an enriched lookup + a
+  // small (~5-10s) Anthropic call to produce a single-page summary.
+  // We forward the body, attach the tenant brand payload, and pass the
+  // upstream JSON response back unchanged. No streaming — a normal
+  // POST/JSON round-trip with a generous timeout to cover the LLM call.
+  app.post("/api/onepager/render", async (req, res) => {
+    const renderUrl = getReportRenderUrl();
+    if (!renderUrl) return res.status(500).json({ error: "FULL_APP_RENDER_URL ontbreekt." });
+    const upstream = renderUrl.replace(/\/api\/full\/render$/i, "/api/onepager/render");
+
+    const reqBody = {
+      ...(req.body || {}),
+      tenant: buildBrandPayload(),
+    };
+
+    const ac = new AbortController();
+    const timeoutMs = Number(process.env.ONEPAGER_PROXY_TIMEOUT_MS || 60000);
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+
+    try {
+      const upstreamRes = await undiciFetch(upstream, {
+        method: "POST",
+        headers: buildReportApiHeaders(),
+        body: JSON.stringify(reqBody),
+        signal: ac.signal,
+        dispatcher: longFetchAgent,
+      });
+
+      const text = await upstreamRes.text();
+      // Pass status code through so the tenant page can react to 404
+      // (address not found), 400 (validation), etc. directly.
+      res.status(upstreamRes.status);
+      res.setHeader("Content-Type", upstreamRes.headers.get("content-type") || "application/json; charset=utf-8");
+      return res.send(text);
+    } catch (e) {
+      const aborted = ac.signal.aborted;
+      const message = aborted
+        ? `Onepager render timeout na ${Math.round(timeoutMs / 1000)}s`
+        : e?.message || String(e);
+      return res.status(aborted ? 504 : 502).json({ error: message, code: aborted ? "onepager_timeout" : "onepager_proxy_error" });
+    } finally {
+      clearTimeout(timer);
     }
   });
 
