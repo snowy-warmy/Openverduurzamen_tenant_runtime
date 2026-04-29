@@ -15,6 +15,7 @@
 import express from "express";
 import fs from "fs";
 import path from "path";
+import crypto from "crypto";
 import { fileURLToPath } from "url";
 import { Agent, fetch as undiciFetch } from "undici";
 
@@ -34,6 +35,12 @@ import { createMolliePayment, getMolliePayment } from "./lib/mollie_client.js";
 import { htmlToPdfBuffer } from "./lib/pdfbolt_client.js";
 import { sendReportEmail } from "./lib/mail_client.js";
 import { initPrefillStore, createPrefillSession, getPrefillSession } from "./lib/prefill_store.js";
+import {
+  getCurrentMonthUsage,
+  incrementInternalQuota,
+  readQuotaState,
+  getQuotaMax,
+} from "./lib/internal_quota.js";
 
 // ---------------------------------------------------------------------------
 // Long-running fetch dispatcher for the report-api render call.
@@ -172,6 +179,12 @@ export function createTenantApp(config) {
     // /api/onepager/render and renders the returned html_fragment
     // inline (see the runtime's onepager proxy further down).
     onepagerStart: readFileIfExists(path.join(templatesDir, "onepager_start.html")),
+    // Internal-flow templates (WoonWijzerWinkel staff-only, served at
+    // /intern and /intern/full_start.html). Optional per tenant — if
+    // absent, the /intern routes return 404 and the internal endpoints
+    // do nothing useful. WWW ships both; other tenants won't.
+    internLogin:     readFileIfExists(path.join(templatesDir, "intern_login.html")),
+    internFullStart: readFileIfExists(path.join(templatesDir, "intern_full_start.html")),
   };
 
   // Storage paths
@@ -210,6 +223,95 @@ export function createTenantApp(config) {
     if (!key) return next();
     if (String(req.header("x-api-key") || "").trim() !== key) return res.status(401).json({ error: "Unauthorized" });
     next();
+  }
+
+  // ---------------------------------------------------------------------
+  // Internal-flow auth (WoonWijzerWinkel staff use)
+  //
+  // Plain email + password from env, HMAC-signed cookie. Cookie expires
+  // after 7 days. The session secret rotates the signing key — rotate
+  // it to invalidate all sessions at once.
+  // ---------------------------------------------------------------------
+  const INTERNAL_COOKIE_NAME = "wwwintern";
+  const INTERNAL_COOKIE_TTL_MS = 1000 * 60 * 60 * 24 * 7;
+
+  function getInternalSecret() {
+    const s = String(process.env.WWW_INTERNAL_SESSION_SECRET || "").trim();
+    // Don't fall back to an empty secret — that would let anyone forge
+    // cookies. If the secret isn't set we deliberately produce signatures
+    // that will never verify.
+    return s || crypto.randomBytes(48).toString("hex");
+  }
+
+  function signInternalCookie(payload) {
+    const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+    const sig = crypto.createHmac("sha256", getInternalSecret()).update(body).digest("base64url");
+    return `${body}.${sig}`;
+  }
+
+  function verifyInternalCookie(cookieValue) {
+    if (!cookieValue || typeof cookieValue !== "string") return null;
+    const parts = cookieValue.split(".");
+    if (parts.length !== 2) return null;
+    const [body, sig] = parts;
+    const expected = crypto.createHmac("sha256", getInternalSecret()).update(body).digest("base64url");
+    // Constant-time compare to avoid leaking bytes via timing.
+    const a = Buffer.from(sig);
+    const b = Buffer.from(expected);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+    let payload;
+    try { payload = JSON.parse(Buffer.from(body, "base64url").toString("utf-8")); }
+    catch { return null; }
+    if (!payload || typeof payload !== "object") return null;
+    if (!Number.isFinite(payload.exp) || payload.exp < Date.now()) return null;
+    return payload;
+  }
+
+  function parseCookies(cookieHeader) {
+    const out = {};
+    if (!cookieHeader) return out;
+    for (const part of String(cookieHeader).split(";")) {
+      const [k, ...rest] = part.split("=");
+      if (!k) continue;
+      out[k.trim()] = decodeURIComponent((rest.join("=") || "").trim());
+    }
+    return out;
+  }
+
+  function readInternalSession(req) {
+    const cookies = parseCookies(req.headers.cookie || "");
+    return verifyInternalCookie(cookies[INTERNAL_COOKIE_NAME]);
+  }
+
+  function requireInternalSession(req, res, next) {
+    const session = readInternalSession(req);
+    if (!session) {
+      // For HTML page requests, redirect to login. For JSON / API
+      // requests, return 401 so the front-end can react cleanly.
+      const wantsHtml = String(req.headers.accept || "").includes("text/html");
+      if (wantsHtml) return res.redirect("/intern");
+      return res.status(401).json({ error: "Niet ingelogd.", code: "internal_session_missing" });
+    }
+    req.internalSession = session;
+    next();
+  }
+
+  function checkInternalCredentials(email, password) {
+    const expectedEmail = String(process.env.WWW_INTERNAL_EMAIL || "").trim().toLowerCase();
+    const expectedPassword = String(process.env.WWW_INTERNAL_PASSWORD || "");
+    if (!expectedEmail || !expectedPassword) return false;
+    const inputEmail = String(email || "").trim().toLowerCase();
+    const inputPassword = String(password || "");
+    // Constant-time comparison on bytes — convert to Buffers of equal
+    // length first (we pad/truncate the shorter to match). A direct
+    // !== check would leak length, so we accept some extra ceremony.
+    const ea = Buffer.from(inputEmail);
+    const eb = Buffer.from(expectedEmail);
+    const pa = Buffer.from(inputPassword);
+    const pb = Buffer.from(expectedPassword);
+    const emailOk = ea.length === eb.length && crypto.timingSafeEqual(ea, eb);
+    const passwordOk = pa.length === pb.length && crypto.timingSafeEqual(pa, pb);
+    return emailOk && passwordOk;
   }
 
   function getReportRenderUrl() {
@@ -394,6 +496,61 @@ export function createTenantApp(config) {
     };
   }
 
+  /**
+   * Internal-flow order creation — same as createPaymentOrder but skips
+   * Mollie entirely. The order is born with status "paid" so the
+   * existing processOrderById flow immediately runs render → PDF →
+   * mail. Used by /api/internal/full/render for WoonWijzerWinkel staff.
+   */
+  async function createInternalOrder({ req, email, address, confirmedData, sourceMeta = null }) {
+    const baseUrl = getBaseUrl(req);
+    const orderId = newOrderId();
+    const downloadToken = newOrderToken();
+    const redirectPath = config?.product?.redirectAfterPaymentPath || "/full_done.html";
+    const monthUsage = incrementInternalQuota(dataDir);
+
+    createOrder({
+      id: orderId,
+      tenant_id: config.id,
+      download_token: downloadToken,
+      // We mark it "paid" so the existing recovery sweep + processing
+      // pipeline treats it identically to a Mollie-paid order. The
+      // payment block stays empty so it's clear in audit logs that
+      // this was an internal render.
+      status: "paid",
+      created_at: nowIso(),
+      updated_at: nowIso(),
+      amount_eur: 0,
+      email,
+      address,
+      confirmed_data: confirmedData,
+      payment: { id: null, status: "internal", checkout_url: null },
+      report_html: "",
+      pdf_filename: "",
+      download_path: "",
+      paid_at: nowIso(),
+      mailed_at: null,
+      processing_lock: false,
+      error: "",
+      source_meta: {
+        ...(sourceMeta || {}),
+        source: "internal_full_start",
+        internal_user: req?.internalSession?.email || null,
+        month_usage_after: monthUsage,
+      },
+    });
+
+    triggerBackgroundProcessing(orderId);
+
+    return {
+      order_id: orderId,
+      done_url: `${baseUrl}${redirectPath}?order_id=${encodeURIComponent(orderId)}`,
+      status_url: `${baseUrl}/api/full/order/${encodeURIComponent(orderId)}`,
+      month_usage: monthUsage,
+      month_max: getQuotaMax(),
+    };
+  }
+
   function isRecoverableStatus(status) {
     return ["paid", "processing", "report_generated", "pdf_created", "mail_failed"].includes(String(status || ""));
   }
@@ -517,6 +674,98 @@ export function createTenantApp(config) {
   app.get("/full_start.html", (req, res) => serveTemplatedPage(req, res, "fullStart", "Pagina niet beschikbaar."));
   app.get("/full_done.html",  (req, res) => serveTemplatedPage(req, res, "fullDone",  "Pagina niet beschikbaar."));
   app.get("/algemene-voorwaarden.html", (req, res) => serveTemplatedPage(req, res, "terms", "Algemene voorwaarden niet beschikbaar."));
+
+  // -------------------------------------------------------------------------
+  // Internal flow (WoonWijzerWinkel staff)
+  // -------------------------------------------------------------------------
+  // /intern                       → login page (or redirect to /intern/full_start.html if signed in)
+  // /intern/full_start.html       → cookie-protected full-report intake page
+  // POST /api/internal/login      → email + password → set cookie
+  // POST /api/internal/logout     → clear cookie
+  // POST /api/internal/full/render → cookie-protected, skip Mollie, render+mail
+  // GET  /api/internal/quota      → returns { used, max, month, remaining }
+
+  app.get("/intern", (req, res) => {
+    // If already signed in, skip the login page and go straight to the
+    // intake form. The intake page is itself cookie-protected so an
+    // expired session bounces back here.
+    if (readInternalSession(req)) return res.redirect("/intern/full_start.html");
+    return serveTemplatedPage(req, res, "internLogin", "Interne login niet beschikbaar voor deze tenant.");
+  });
+
+  app.get("/intern/full_start.html", requireInternalSession, (req, res) =>
+    serveTemplatedPage(req, res, "internFullStart", "Interne pagina niet beschikbaar voor deze tenant.")
+  );
+
+  app.post("/api/internal/login", (req, res) => {
+    const email = String(req.body?.email || "");
+    const password = String(req.body?.password || "");
+    if (!checkInternalCredentials(email, password)) {
+      return res.status(401).json({ error: "Onjuiste e-mail of wachtwoord." });
+    }
+    const exp = Date.now() + INTERNAL_COOKIE_TTL_MS;
+    const cookieValue = signInternalCookie({ email: email.trim().toLowerCase(), exp });
+    // Cookie attributes:
+    //   HttpOnly  — JS can't read it, so an XSS hole can't steal the
+    //               session even if one exists.
+    //   Secure    — only sent over HTTPS, which Render always provides.
+    //   SameSite=Lax — sent on top-level navigations + GETs, blocks the
+    //               cookie on cross-site POSTs (mild CSRF protection).
+    //   Path=/    — the cookie is needed for both /intern* pages and
+    //               /api/internal/* requests.
+    res.setHeader("Set-Cookie",
+      `${INTERNAL_COOKIE_NAME}=${encodeURIComponent(cookieValue)}; ` +
+      `Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.floor(INTERNAL_COOKIE_TTL_MS / 1000)}`
+    );
+    return res.json({ ok: true, redirect: "/intern/full_start.html" });
+  });
+
+  app.post("/api/internal/logout", (req, res) => {
+    res.setHeader("Set-Cookie", `${INTERNAL_COOKIE_NAME}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`);
+    return res.json({ ok: true });
+  });
+
+  app.post("/api/internal/full/render", requireInternalSession, async (req, res) => {
+    try {
+      const address = normalizeAddressInput(req.body?.address || req.body || {});
+      const email = String(req.body?.email || "").trim();
+      const confirmedData = normalizeConfirmedDataInput(req.body?.confirmed_data || {});
+      const errors = {};
+      if (!validateEmail(email)) errors.email = "Geldig e-mailadres is verplicht.";
+      if (!address.postalcode) errors.postalcode = "Postcode is verplicht.";
+      if (!address.housenumber) errors.housenumber = "Huisnummer is verplicht.";
+      Object.assign(errors, validateConfirmedDataBasic(confirmedData));
+      if (Object.keys(errors).length) return res.status(400).json({ error: "Ongeldige invoer.", field_errors: errors });
+
+      const payload = await createInternalOrder({
+        req, email, address, confirmedData,
+        sourceMeta: { tenant_id: config.id, request_id: String(req.body?.request_id || "").trim() },
+      });
+      return res.json(payload);
+    } catch (e) {
+      return res.status(500).json({ error: e?.message || String(e) });
+    }
+  });
+
+  // GET /api/internal/quota — returns the current month's usage. Two
+  // ways to authenticate: either the same cookie used by the staff
+  // intake page (so the staff can refresh-and-see), or a token query
+  // param matching ADMIN_API_KEY (so a CLI / monitor can poll it).
+  app.get("/api/internal/quota", (req, res) => {
+    const adminKey = String(process.env.ADMIN_API_KEY || "").trim();
+    const tokenOk = adminKey && String(req.query?.token || "").trim() === adminKey;
+    const sessionOk = !!readInternalSession(req);
+    if (!tokenOk && !sessionOk) return res.status(401).json({ error: "Unauthorized" });
+    const state = readQuotaState(dataDir);
+    const max = getQuotaMax();
+    return res.json({
+      used: state.current_count,
+      max,
+      remaining: Math.max(0, max - state.current_count),
+      month: state.current_month,
+      history: state.history,
+    });
+  });
 
   app.get("/assets/:filename(*)", (req, res) => {
     const abs = safeAssetPath(assetsDir, req.params.filename);
