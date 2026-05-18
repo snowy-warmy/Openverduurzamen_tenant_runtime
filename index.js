@@ -687,9 +687,17 @@ export function createTenantApp(config) {
           ? `${baseUrlConfigured}/r/${order.id}?t=${order.download_token}`
           : "";
         // Build a human-readable address line from whatever fields are
-        // present. Tenants can use {{ADDRESS}} in their email template.
+        // present. Tenants can use {{ADDRESS}} in their email template
+        // and subject template. Format: "<postcode> <huisnummer><toevoeging>"
+        // — toevoeging is concatenated to the housenumber without a space
+        // (Dutch convention: "11A", not "11 A"). Falls back to addr_line
+        // if a future caller stores the resolved BAG street/city line.
+        const numberWithAddition = [order.address?.housenumber, order.address?.houseaddition]
+          .filter(Boolean)
+          .map((s) => String(s).trim())
+          .join("");
         const addressLine = order.address?.addr_line
-          || [order.address?.postalcode, order.address?.housenumber, order.address?.houseaddition]
+          || [order.address?.postalcode, numberWithAddition]
               .filter(Boolean).join(" ").trim()
           || "";
         await sendReportEmail({
