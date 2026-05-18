@@ -33,7 +33,7 @@ import {
 } from "./lib/orders_store.js";
 import { createMolliePayment, getMolliePayment } from "./lib/mollie_client.js";
 import { htmlToPdfBuffer } from "./lib/pdfbolt_client.js";
-import { sendReportEmail } from "./lib/mail_client.js";
+import { sendReportEmail, sendLeadEmail } from "./lib/mail_client.js";
 import { initPrefillStore, createPrefillSession, getPrefillSession } from "./lib/prefill_store.js";
 import {
   getCurrentMonthUsage,
@@ -1251,6 +1251,230 @@ export function createTenantApp(config) {
     await recoverPendingOrders();
     return res.json({ ok: true });
   });
+
+  // -------------------------------------------------------------------------
+  // Lead form
+  //
+  // Visitors can leave their contact details via a modal on the mid_start
+  // (in-iframe), full_start, and full_done pages. We email the lead to
+  // LEAD_EMAIL (env), with replyTo set to the visitor so the team can hit
+  // reply directly. Light per-IP rate limiting prevents trivial spam; the
+  // form also carries a honeypot field that bots typically fill.
+  // -------------------------------------------------------------------------
+  const LEAD_MAX_PER_HOUR = Number(process.env.LEAD_MAX_PER_HOUR || 5);
+  const leadRateLimit = new Map(); // ip -> array of epoch_ms timestamps
+
+  function leadCheckRate(ip) {
+    if (!ip) return true; // can't rate-limit without an ip; allow.
+    const now = Date.now();
+    const cutoff = now - 60 * 60 * 1000;
+    const list = (leadRateLimit.get(ip) || []).filter((t) => t > cutoff);
+    if (list.length >= LEAD_MAX_PER_HOUR) {
+      leadRateLimit.set(ip, list);
+      return false;
+    }
+    list.push(now);
+    leadRateLimit.set(ip, list);
+    // Occasional GC so the map doesn't grow unbounded on a long-running process.
+    if (leadRateLimit.size > 500) {
+      for (const [k, ts] of leadRateLimit) {
+        if (!ts.some((t) => t > cutoff)) leadRateLimit.delete(k);
+      }
+    }
+    return true;
+  }
+
+  function getClientIp(req) {
+    const fwd = req.headers["x-forwarded-for"];
+    if (typeof fwd === "string" && fwd.length) return fwd.split(",")[0].trim();
+    return req.ip || req.connection?.remoteAddress || "";
+  }
+
+  app.post("/api/lead", async (req, res) => {
+    try {
+      const body = req.body || {};
+
+      // Honeypot. Bots fill every field; real users never see this one.
+      if (typeof body.website === "string" && body.website.trim() !== "") {
+        // Lie about success so bots don't retry. No email is sent.
+        return res.json({ ok: true });
+      }
+
+      const firstName = String(body.firstName || "").trim().slice(0, 80);
+      const lastName  = String(body.lastName  || "").trim().slice(0, 80);
+      const email     = String(body.email     || "").trim().slice(0, 200);
+      const phone     = String(body.phone     || "").trim().slice(0, 40);
+      const message   = String(body.message   || "").slice(0, 2000);
+      const sourcePage = String(body.sourcePage || "").trim().slice(0, 60);
+
+      const errors = [];
+      if (!firstName) errors.push("Voornaam is verplicht.");
+      if (!lastName)  errors.push("Achternaam is verplicht.");
+      if (!email || !/^\S+@\S+\.\S+$/.test(email)) errors.push("Geldig e-mailadres is verplicht.");
+      if (!phone || phone.replace(/\D/g, "").length < 6) errors.push("Geldig telefoonnummer is verplicht.");
+      if (errors.length) {
+        return res.status(400).json({ ok: false, error: errors.join(" ") });
+      }
+
+      const ip = getClientIp(req);
+      if (!leadCheckRate(ip)) {
+        return res.status(429).json({ ok: false, error: "Te veel aanvragen. Probeer het later opnieuw." });
+      }
+
+      // -----------------------------------------------------------
+      // Build the optional report-context section + attachments
+      // depending on where the lead came from. mid_report attaches
+      // the rendered HTML; full_done attaches the saved PDF and
+      // includes a 365-day download link.
+      // -----------------------------------------------------------
+      const ctxIn = (body.context && typeof body.context === "object") ? body.context : {};
+      let reportContext = null;
+      const attachments = [];
+
+      // Localisation maps for confirmed_data values (same source-of-truth as
+      // full_start.html's OPTIONS so the email is readable for WWW staff).
+      const LABEL_MAP = {
+        soort_woning: { tussenwoning:"Tussenwoning", hoekwoning:"Hoekwoning", twee_onder_een_kap:"2-onder-1-kap", vrijstaand:"Vrijstaand", appartement:"Appartement" },
+        energy_label: { "a++++":"A++++","a+++":"A+++","a++":"A++","a+":"A+","a":"A","b":"B","c":"C","d":"D","e":"E","f":"F","g":"G","unknown":"Onbekend" },
+        ventilation_type: { natuurlijk:"Natuurlijk", mechanisch:"Mechanisch", unknown:"Onbekend" },
+        heating_supply: { cv_ketel:"CV-ketel", warmtepomp:"Warmtepomp", pelletkachel:"Pelletkachel", warmtenet:"Warmtenet", unknown:"Onbekend" },
+        heat_distribution: { radiatoren_convectoren:"Radiatoren/convectoren", elektrische_radiatoren_convectoren:"Elektrische radiatoren/convectoren", vloerverwarming_water:"Vloerverwarming (water)", vloerverwarming_elektrisch:"Vloerverwarming (elektrisch)", infraroodpanelen:"Infrarood panelen", unknown:"Onbekend" },
+        existing_measures: { vloerisolatie:"Vloerisolatie", muurisolatie:"Muurisolatie", dakisolatie:"Dakisolatie", glasisolatie:"Glasisolatie", zonnepanelen:"Zonnepanelen", thuisbatterij:"Thuisbatterij", warmtepomp:"Warmtepomp", zonneboiler:"Zonneboiler", elektrische_tapwaterverwarming:"Elektrische tapwaterverwarming" },
+      };
+      const FIELD_LABELS = {
+        soort_woning: "Soort woning", build_year: "Bouwjaar", floor_area_m2: "Woonoppervlakte (m²)", energy_label: "Huidig energielabel",
+        ventilation_type: "Ventilatie", heating_supply: "Warmtevoorziening", heat_distribution: "Warmtesysteem", existing_measures: "Reeds aanwezig",
+      };
+      function humanizeConfirmed(cd) {
+        if (!cd || typeof cd !== "object") return [];
+        const out = [];
+        for (const key of Object.keys(FIELD_LABELS)) {
+          const v = cd[key];
+          if (v === undefined || v === null || v === "") continue;
+          if (Array.isArray(v)) {
+            const labels = v.map((x) => LABEL_MAP[key]?.[x] || x).filter(Boolean);
+            if (labels.length) out.push([FIELD_LABELS[key], labels.join(", ")]);
+          } else {
+            const label = LABEL_MAP[key]?.[String(v).toLowerCase()] || String(v);
+            out.push([FIELD_LABELS[key], label]);
+          }
+        }
+        return out;
+      }
+      function formatAddress(addr) {
+        if (!addr || typeof addr !== "object") return "";
+        if (addr.addr_line) return String(addr.addr_line);
+        const num = [addr.housenumber, addr.houseaddition].filter(Boolean).map(String).map((s) => s.trim()).join("");
+        return [addr.postalcode, num].filter(Boolean).join(" ").trim();
+      }
+
+      // ----- mid_report path -----
+      // Client sends: { productType:"mid_report", address, confirmedData,
+      //                 reportHtml (capped at ~1MB) }
+      if (ctxIn.productType === "mid_report") {
+        const rows = [];
+        const addr = formatAddress(ctxIn.address);
+        if (addr) rows.push(["Adres", addr]);
+        rows.push(...humanizeConfirmed(ctxIn.confirmedData));
+
+        // Cap and attach the report HTML so WWW sees what the user saw.
+        const rawHtml = typeof ctxIn.reportHtml === "string" ? ctxIn.reportHtml : "";
+        if (rawHtml && rawHtml.length < 1_500_000) {
+          const fnameSafe = (addr || "rapport").replace(/[^a-z0-9]+/gi, "_").slice(0, 60) || "rapport";
+          const standalone = `<!doctype html><html lang="nl"><head><meta charset="utf-8"><title>Mid-rapport — ${escapeHtmlSimple(addr || "")}</title>
+<style>body{font-family:Arial,Helvetica,sans-serif;color:#0f172a;line-height:1.55;max-width:920px;margin:24px auto;padding:0 16px}</style>
+</head><body><h1>Mid-rapport</h1><p><b>Adres:</b> ${escapeHtmlSimple(addr || "")}</p><hr/>${rawHtml}</body></html>`;
+          attachments.push({ filename: `mid_rapport_${fnameSafe}.html`, content: Buffer.from(standalone, "utf8") });
+        }
+
+        reportContext = { title: "Mid-rapport gegevens", rows };
+      }
+
+      // ----- full_start path -----
+      // Client sends whatever the visitor has typed so far. No order
+      // exists yet (they haven't paid), so no PDF / link.
+      if (ctxIn.productType === "full_start") {
+        const rows = [];
+        const addr = formatAddress(ctxIn.address);
+        if (addr) rows.push(["Adres", addr]);
+        if (ctxIn.customerEmail) rows.push(["Opgegeven e-mail", String(ctxIn.customerEmail).slice(0, 200)]);
+        rows.push(...humanizeConfirmed(ctxIn.confirmedData));
+        if (rows.length) reportContext = { title: "Bezoeker was bezig met bestelling", rows };
+      }
+
+      // ----- full_done path -----
+      // Client sends just the order_id. We look up the saved order to
+      // build address, summary, the 365-day download URL, and attach
+      // the PDF (same one the customer received).
+      if (ctxIn.productType === "full_done" && ctxIn.orderId) {
+        try {
+          const order = getOrderById(String(ctxIn.orderId));
+          if (order) {
+            const rows = [];
+            rows.push(["Ordernummer", order.id]);
+            const addr = formatAddress(order.address);
+            if (addr) rows.push(["Adres", addr]);
+            rows.push(...humanizeConfirmed(order.confirmed_data));
+            rows.push(["Status", String(order.status || "")]);
+            if (order.email) rows.push(["E-mail van bestelling", order.email]);
+
+            const baseUrl = String(process.env.APP_BASE_URL || "").trim().replace(/\/$/, "");
+            const downloadUrl = baseUrl && order.download_token
+              ? `${baseUrl}/r/${order.id}?t=${order.download_token}`
+              : "";
+
+            // Attach the PDF if it's still on disk (within the 365-day
+            // retention window). If it has been cleaned up, the email
+            // gracefully degrades to "link only".
+            if (order.download_path && !order.pdf_deleted_at && fs.existsSync(order.download_path)) {
+              try {
+                const pdfBuffer = fs.readFileSync(order.download_path);
+                const filename = order.pdf_filename || `rapport_${order.id}.pdf`;
+                attachments.push({ filename, content: pdfBuffer });
+              } catch (e) {
+                // eslint-disable-next-line no-console
+                console.warn("[lead] kon PDF niet lezen voor order", order.id, e?.message || e);
+              }
+            }
+
+            reportContext = { title: "Bestelling: Volledig Rapport", rows, downloadUrl };
+          }
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.warn("[lead] kon order niet ophalen:", e?.message || e);
+        }
+      }
+
+      await sendLeadEmail({
+        firstName,
+        lastName,
+        email,
+        phone,
+        message,
+        sourcePage,
+        config,
+        reportContext,
+        attachments,
+        meta: {
+          ip,
+          userAgent: String(req.headers["user-agent"] || "").slice(0, 200),
+          tenant: config.id,
+        },
+      });
+
+      return res.json({ ok: true });
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("[lead] verzenden mislukt:", e?.message || e);
+      return res.status(500).json({ ok: false, error: "Versturen mislukt. Probeer het later opnieuw." });
+    }
+  });
+
+  // Tiny escape helper used by the inline standalone HTML wrapper above.
+  // Kept inside createTenantApp so it shares the closure.
+  function escapeHtmlSimple(s) {
+    return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
 
   // Boot-time: run a recovery sweep + schedule periodic sweeps for any
   // orders that got stuck mid-flight (Render restart, network blip, etc.).
