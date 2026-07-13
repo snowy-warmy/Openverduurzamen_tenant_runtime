@@ -382,6 +382,10 @@ export function createTenantApp(config) {
       tenant: buildBrandPayload(),
       generation_options: { enable_photo_analysis: false, enable_web_search: true },
     };
+    // EPA-driven orders (e.g. Softbee): send the parsed 0-meting so report-api
+    // builds the full report from the measured assessment instead of an
+    // EP-Online/BAG lookup.
+    if (order.epa_model) reqBody.epa_model = order.epa_model;
 
     const t0 = Date.now();
     const ac = new AbortController();
@@ -446,7 +450,7 @@ export function createTenantApp(config) {
     }));
   }
 
-  async function createPaymentOrder({ req, email, address, confirmedData, sourceMeta = null }) {
+  async function createPaymentOrder({ req, email, address, confirmedData, sourceMeta = null, epaModel = null }) {
     const baseUrl = getBaseUrl(req);
     const orderId = newOrderId();
     const downloadToken = newOrderToken();
@@ -477,6 +481,7 @@ export function createTenantApp(config) {
       email,
       address,
       confirmed_data: confirmedData,
+      epa_model: epaModel || null,
       payment: { id: payment.id, status: payment.status, checkout_url: payment.checkout_url },
       report_html: "",
       pdf_filename: "",
@@ -907,6 +912,30 @@ export function createTenantApp(config) {
   // report-api directly.
   // -------------------------------------------------------------------------
 
+  // EPA ingest proxy. The browser uploads a base64 .epa; we forward it to
+  // report-api's /api/epa/ingest and return the parsed model + labelsprongen.
+  // Used by EPA-driven tenants (Softbee) whose intake is a file upload rather
+  // than a postcode lookup.
+  app.post("/api/epa/ingest", async (req, res) => {
+    try {
+      const renderUrl = getReportRenderUrl();
+      if (!renderUrl) return res.status(500).json({ error: "FULL_APP_RENDER_URL ontbreekt." });
+      const upstream = renderUrl.replace(/\/api\/full\/render$/i, "/api/epa/ingest");
+      const r = await undiciFetch(upstream, {
+        method: "POST",
+        headers: buildReportApiHeaders(),
+        body: JSON.stringify(req.body || {}),
+        dispatcher: longFetchAgent,
+      });
+      const text = await r.text();
+      res.status(r.status);
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      return res.send(text);
+    } catch (e) {
+      return res.status(502).json({ error: e?.message || String(e), code: "epa_proxy_error" });
+    }
+  });
+
   // Address lookup. Identical contract to /api/full/lookup-address — the
   // old Mid frontend just calls a different path. Kept as a separate
   // route so no frontend changes are needed.
@@ -1065,17 +1094,24 @@ export function createTenantApp(config) {
   // we mint a prefill token and return a start_url.
   async function handleMidHandoff(req, res) {
     try {
-      const address = normalizeAddressInput(req.body?.address || req.body || {});
+      const epaModel = req.body?.epa_model && typeof req.body.epa_model === "object" ? req.body.epa_model : null;
+      // For EPA (0-meting) handoffs the measured assessment is authoritative, so
+      // the address comes from the EPA and confirmed_data is optional.
+      const address = normalizeAddressInput(
+        req.body?.address || (epaModel ? epaModel.address : null) || req.body || {}
+      );
       const confirmedData = normalizeConfirmedDataInput(req.body?.confirmed_data || {});
       const errors = {};
-      if (!address.postalcode) errors.postalcode = "Postcode is verplicht.";
-      if (!address.housenumber) errors.housenumber = "Huisnummer is verplicht.";
-      Object.assign(errors, validateConfirmedDataBasic(confirmedData));
+      if (!epaModel) {
+        if (!address.postalcode) errors.postalcode = "Postcode is verplicht.";
+        if (!address.housenumber) errors.housenumber = "Huisnummer is verplicht.";
+        Object.assign(errors, validateConfirmedDataBasic(confirmedData));
+      }
       if (Object.keys(errors).length) return res.status(400).json({ error: "Ongeldige handoff payload.", field_errors: errors });
 
       const baseUrl = getBaseUrl(req);
       const session = createPrefillSession({
-        source: String(req.body?.source || "mid").trim() || "mid",
+        source: String(req.body?.source || (epaModel ? "epa" : "mid")).trim() || "mid",
         tenant_id: config.id,
         request_id: String(req.body?.request_id || "").trim(),
         cta_source: String(req.body?.cta_source || "").trim(),
@@ -1083,6 +1119,7 @@ export function createTenantApp(config) {
         validated_address: req.body?.validated_address && typeof req.body.validated_address === "object" ? req.body.validated_address : null,
         confirmed_data: confirmedData,
         source_facts: req.body?.source_facts && typeof req.body.source_facts === "object" ? req.body.source_facts : null,
+        epa_model: epaModel,
       });
       return res.json({ handoff_token: session.token, start_url: `${baseUrl}/full_start.html?handoff=${encodeURIComponent(session.token)}` });
     } catch (e) { return res.status(500).json({ error: e?.message || String(e) }); }
@@ -1135,13 +1172,18 @@ export function createTenantApp(config) {
       if (!session) return res.status(404).json({ error: "Handoff niet gevonden of verlopen." });
       const acceptTerms = req.body?.accept_terms === true || String(req.body?.accept_terms || "").toLowerCase() === "true";
       if (!acceptTerms) return res.status(400).json({ error: "Akkoord met de algemene voorwaarden is verplicht.", field_errors: { accept_terms: "Akkoord met de algemene voorwaarden is verplicht." } });
-      const errors = validateConfirmedDataBasic(session.confirmed_data || {});
-      if (Object.keys(errors).length) return res.status(400).json({ error: "Handoff bevat ongeldige woninggegevens.", field_errors: errors });
+      // EPA handoffs carry the authoritative measured model; confirmed_data is
+      // optional and therefore not re-validated.
+      if (!session.epa_model) {
+        const errors = validateConfirmedDataBasic(session.confirmed_data || {});
+        if (Object.keys(errors).length) return res.status(400).json({ error: "Handoff bevat ongeldige woninggegevens.", field_errors: errors });
+      }
 
       const payload = await createPaymentOrder({
         req, email,
         address: session.address,
         confirmedData: normalizeConfirmedDataInput(session.confirmed_data || {}),
+        epaModel: session.epa_model || null,
         sourceMeta: { source: session.source || "mid", tenant_id: config.id, request_id: session.request_id || "", cta_source: session.cta_source || "", handoff_token: session.token, validated_address: session.validated_address || null, source_facts: session.source_facts || null },
       });
       return res.json(payload);
