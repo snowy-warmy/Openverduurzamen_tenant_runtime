@@ -35,6 +35,7 @@ import { createMolliePayment, getMolliePayment } from "./lib/mollie_client.js";
 import { htmlToPdfBuffer } from "./lib/pdfbolt_client.js";
 import { sendReportEmail, sendLeadEmail } from "./lib/mail_client.js";
 import { initPrefillStore, createPrefillSession, getPrefillSession } from "./lib/prefill_store.js";
+import { initFeedbackStore, appendFeedback, listFeedback, feedbackStats } from "./lib/feedback_store.js";
 import {
   getCurrentMonthUsage,
   incrementInternalQuota,
@@ -194,6 +195,7 @@ export function createTenantApp(config) {
 
   initOrdersStore();
   initPrefillStore();
+  initFeedbackStore();
 
   const app = express();
   app.set("trust proxy", true);
@@ -1312,6 +1314,80 @@ export function createTenantApp(config) {
 
   app.get("/api/admin/orders", requireAdminKey, (_req, res) => {
     return res.json({ orders: listOrders(200).map(buildOrderPublicView).slice(0, 100) });
+  });
+
+  // -------------------------------------------------------------------------
+  // EPA-preview feedback ("klopt / klopt niet" + free text). This is the
+  // correctness loop for the EPA parser: a file can parse successfully while
+  // still surfacing wrong data, and only the viewer (resident or
+  // EP-adviseur) can tell. Entries are stored (epa_feedback.json) and
+  // readable below so acceptance can actually be measured over time.
+  // -------------------------------------------------------------------------
+  const FEEDBACK_MAX_PER_HOUR = Number(process.env.FEEDBACK_MAX_PER_HOUR || 10);
+  const feedbackRateLimit = new Map(); // ip -> array of epoch_ms timestamps
+
+  function feedbackCheckRate(ip) {
+    if (!ip) return true;
+    const now = Date.now();
+    const cutoff = now - 60 * 60 * 1000;
+    const list = (feedbackRateLimit.get(ip) || []).filter((t) => t > cutoff);
+    if (list.length >= FEEDBACK_MAX_PER_HOUR) {
+      feedbackRateLimit.set(ip, list);
+      return false;
+    }
+    list.push(now);
+    feedbackRateLimit.set(ip, list);
+    if (feedbackRateLimit.size > 500) {
+      for (const [k, ts] of feedbackRateLimit) {
+        if (!ts.some((t) => t > cutoff)) feedbackRateLimit.delete(k);
+      }
+    }
+    return true;
+  }
+
+  app.post("/api/epa/feedback", (req, res) => {
+    try {
+      const body = req.body || {};
+
+      // Honeypot, same idea as the lead form.
+      if (typeof body.website === "string" && body.website.trim() !== "") {
+        return res.json({ ok: true });
+      }
+
+      if (!feedbackCheckRate(getClientIp(req))) {
+        return res.status(429).json({ ok: false, error: "Te veel verzoeken. Probeer het later opnieuw." });
+      }
+
+      const rating = body.rating;
+      if (rating !== "correct" && rating !== "incorrect") {
+        return res.status(400).json({ ok: false, error: 'rating moet "correct" of "incorrect" zijn.' });
+      }
+      const message = String(body.message || "").trim().slice(0, 2000);
+      if (rating === "incorrect" && !message) {
+        return res.status(400).json({
+          ok: false,
+          error: "Vertel kort wat er niet klopt, dan kunnen wij het verbeteren.",
+        });
+      }
+
+      const entry = appendFeedback({
+        tenant_id: config.id,
+        rating,
+        message,
+        context: body.context && typeof body.context === "object" ? body.context : {},
+      });
+      console.log(
+        `[feedback] tenant=${config.id} rating=${rating} registratienummer=${entry.context?.registratienummer || "-"} has_message=${Boolean(message)}`
+      );
+      return res.json({ ok: true, id: entry.id });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: e?.message || String(e) });
+    }
+  });
+
+  app.get("/api/admin/feedback", requireAdminKey, (req, res) => {
+    const limit = Number(req.query.limit || 200);
+    return res.json({ stats: feedbackStats(), feedback: listFeedback(limit) });
   });
 
   app.post("/api/admin/recover-orders", requireAdminKey, async (_req, res) => {
