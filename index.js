@@ -197,6 +197,14 @@ export function createTenantApp(config) {
 
   const app = express();
   app.set("trust proxy", true);
+  // EPA-carrying routes accept larger bodies: a base64 .epa inflates ~33% and
+  // zipped 0-metingen can be several MB. Path-scoped parsers run BEFORE the
+  // global 5mb parser; body-parser skips already-parsed bodies, so every other
+  // endpoint keeps the tighter limit.
+  app.use("/api/epa/ingest", express.json({ limit: "20mb" }));
+  app.use("/api/mid/stream", express.json({ limit: "20mb" }));
+  app.use("/api/mid/full-report-handoff", express.json({ limit: "20mb" }));
+  app.use("/api/full/handoff", express.json({ limit: "20mb" }));
   app.use(express.json({ limit: "5mb" }));
   app.use(express.urlencoded({ extended: false }));
 
@@ -916,23 +924,40 @@ export function createTenantApp(config) {
   // report-api's /api/epa/ingest and return the parsed model + labelsprongen.
   // Used by EPA-driven tenants (Softbee) whose intake is a file upload rather
   // than a postcode lookup.
+  const EPA_INGEST_TIMEOUT_MS = Number(process.env.EPA_INGEST_TIMEOUT_MS || 120000);
   app.post("/api/epa/ingest", async (req, res) => {
     try {
       const renderUrl = getReportRenderUrl();
       if (!renderUrl) return res.status(500).json({ error: "FULL_APP_RENDER_URL ontbreekt." });
       const upstream = renderUrl.replace(/\/api\/full\/render$/i, "/api/epa/ingest");
-      const r = await undiciFetch(upstream, {
-        method: "POST",
-        headers: buildReportApiHeaders(),
-        body: JSON.stringify(req.body || {}),
-        dispatcher: longFetchAgent,
-      });
+      const abort = new AbortController();
+      const timer = setTimeout(() => abort.abort(), EPA_INGEST_TIMEOUT_MS);
+      let r;
+      try {
+        r = await undiciFetch(upstream, {
+          method: "POST",
+          headers: buildReportApiHeaders(),
+          body: JSON.stringify(req.body || {}),
+          dispatcher: longFetchAgent,
+          signal: abort.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
       const text = await r.text();
       res.status(r.status);
       res.setHeader("Content-Type", "application/json; charset=utf-8");
       return res.send(text);
     } catch (e) {
-      return res.status(502).json({ error: e?.message || String(e), code: "epa_proxy_error" });
+      const timedOut = e?.name === "AbortError";
+      return res
+        .status(502)
+        .json({
+          error: timedOut
+            ? "De EPA-verwerking duurde te lang. Probeer het opnieuw of neem contact op als het probleem blijft."
+            : e?.message || String(e),
+          code: timedOut ? "epa_proxy_timeout" : "epa_proxy_error",
+        });
     }
   });
 
