@@ -1386,27 +1386,39 @@ export function createTenantApp(config) {
         const rawHtml = typeof ctxIn.reportHtml === "string" ? ctxIn.reportHtml : "";
         if (rawHtml && rawHtml.length < 1_500_000) {
           const fnameSafe = (addr || "rapport").replace(/[^a-z0-9]+/gi, "_").slice(0, 60) || "rapport";
-          // Print-CSS: de rapport-HTML is een weblayout (max ~920px breed,
-          // kaarten en 3-koloms vergelijkingstabellen). Op A4-portret
-          // (794px @96dpi) knipt dat rechts af en splitten kaarten door
-          // de paginagrens. Vandaar: @page-marges, een zoom die de
-          // weblayout passend schaalt (920→718px op 192mm inclusief
-          // marges), break-inside: avoid voor kaarten/tabellen en
-          // breedte-vangnetten voor img/svg/table.
-          const standalone = `<!doctype html><html lang="nl"><head><meta charset="utf-8"><title>Mid-rapport — ${escapeHtmlSimple(addr || "")}</title>
+          // Print-CSS, afgestemd op de mid-report classes (.mid-*): het
+          // webrapport is ruim gebouwd (grid 200px+3x1fr, flex-headers,
+          // kaarten met schaduw). Voor A4: compactie via zoom, header als
+          // blok, compacte labelkolom, kerngegevens als vloeiende grid,
+          // footer als gestapeld CTA-blok, en pagina-einden die rijen en
+          // kaarten heel houden. Geen afgeknipte kolommen meer en een
+          // goed gevulde pagina-indeling (gekalibreerd op de box met een
+          // echt rapport, sep 2026).
+          const standalone = `<!doctype html><html lang="nl"><head><meta charset="utf-8"><title>Mid-rapport — \${escapeHtmlSimple(addr || "")}</title>
 <style>
 @page { size: A4; margin: 10mm 9mm; }
 html, body { margin: 0; padding: 0; }
-body { font-family: Arial, Helvetica, sans-serif; color: #0f172a; line-height: 1.55; }
-.rapport { max-width: 920px; margin: 0 auto; zoom: 0.78; }
-.rapport table, .rapport tr, .rapport [class*="card"], .rapport [class*="Card"] { break-inside: avoid; }
-.rapport h1, .rapport h2, .rapport h3 { break-after: avoid; }
-.rapport thead { display: table-header-group; }
+body { font-family: 'DM Sans','Inter',Arial,Helvetica,sans-serif; color: #0f172a; }
+.rapport { width: 100%; zoom: 0.82; }
+.rapport .mid-report { padding: 0 0 4px 0 !important; border: 0 !important; border-radius: 0 !important; box-shadow: none !important; background: #fff !important; }
+.rapport div[style*="margin-top:14px"] { margin-top: 8px !important; }
+.rapport div[style*="margin-top:16px"] { margin-top: 8px !important; }
+.rapport .mid-header { display: block !important; }
+.rapport .mid-header > * { margin-top: 3px; }
+.rapport .mid-grid { grid-template-columns: 88px repeat(3, 1fr) !important; width: 100% !important; box-shadow: none !important; }
+.rapport .mid-grid [style*="width:200px"] { width: auto !important; min-width: 0 !important; }
+.rapport .mid-grid * { min-width: 0 !important; overflow-wrap: break-word; white-space: normal; }
+.rapport .mid-kerngegevens { display: grid !important; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)) !important; gap: 7px !important; }
+.rapport .mid-kerngegevens-item { margin: 0 !important; break-inside: avoid; }
+.rapport .mid-footer { display: block !important; }
+.rapport .mid-footer-cta { margin-top: 6px; }
+.rapport .mid-footer-cta button { display: inline-block !important; margin-top: 4px; }
+.rapport .mid-grid, .rapport .mid-kerngegevens-item,
+.rapport .mid-footer, .rapport .mid-label-chip { break-inside: avoid; }
+.rapport h1, .rapport h2, .rapport h3, .rapport .mid-headline { break-after: avoid; }
 .rapport img, .rapport svg { max-width: 100% !important; height: auto; }
-.rapport table { max-width: 100% !important; }
-.rapport * { overflow-wrap: break-word; }
 </style>
-</head><body><div class="rapport"><h1>Mid-rapport</h1><p><b>Adres:</b> ${escapeHtmlSimple(addr || "")}</p><hr/>${rawHtml}</div></body></html>`;
+</head><body><div class="rapport"><div style="margin-bottom:8px"><h1 style="font-size:19px;margin:0 0 2px 0">Mid-rapport</h1><p style="margin:0;color:#64748b"><b style="color:#0f172a">Adres:</b> \${escapeHtmlSimple(addr || "")}</p></div>\${rawHtml}</div></body></html>`;
           try {
             const pdfBuffer = await htmlToPdfBuffer(standalone);
             attachments.push({ filename: `mid_rapport_${fnameSafe}.pdf`, content: pdfBuffer });
