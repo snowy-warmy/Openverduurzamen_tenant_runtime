@@ -1377,14 +1377,26 @@ export function createTenantApp(config) {
         if (addr) rows.push(["Adres", addr]);
         rows.push(...humanizeConfirmed(ctxIn.confirmedData));
 
-        // Cap and attach the report HTML so WWW sees what the user saw.
+        // Cap and attach the report so WWW sees what the user saw.
+        // WWW asked for the attachment as PDF, so we render the
+        // standalone HTML through PDFBolt (same engine as the paid
+        // full report). If PDF generation fails we fall back to the
+        // HTML attachment — a lead mail with an .html attachment
+        // still beats no attachment at all.
         const rawHtml = typeof ctxIn.reportHtml === "string" ? ctxIn.reportHtml : "";
         if (rawHtml && rawHtml.length < 1_500_000) {
           const fnameSafe = (addr || "rapport").replace(/[^a-z0-9]+/gi, "_").slice(0, 60) || "rapport";
           const standalone = `<!doctype html><html lang="nl"><head><meta charset="utf-8"><title>Mid-rapport — ${escapeHtmlSimple(addr || "")}</title>
 <style>body{font-family:Arial,Helvetica,sans-serif;color:#0f172a;line-height:1.55;max-width:920px;margin:24px auto;padding:0 16px}</style>
 </head><body><h1>Mid-rapport</h1><p><b>Adres:</b> ${escapeHtmlSimple(addr || "")}</p><hr/>${rawHtml}</body></html>`;
-          attachments.push({ filename: `mid_rapport_${fnameSafe}.html`, content: Buffer.from(standalone, "utf8") });
+          try {
+            const pdfBuffer = await htmlToPdfBuffer(standalone);
+            attachments.push({ filename: `mid_rapport_${fnameSafe}.pdf`, content: pdfBuffer });
+          } catch (e) {
+            // eslint-disable-next-line no-console
+            console.warn("[lead] kon mid-rapport PDF niet genereren, val terug op HTML-bijlage:", e?.message || e);
+            attachments.push({ filename: `mid_rapport_${fnameSafe}.html`, content: Buffer.from(standalone, "utf8") });
+          }
         }
 
         reportContext = { title: "Mid-rapport gegevens", rows };
