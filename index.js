@@ -1386,9 +1386,27 @@ export function createTenantApp(config) {
         const rawHtml = typeof ctxIn.reportHtml === "string" ? ctxIn.reportHtml : "";
         if (rawHtml && rawHtml.length < 1_500_000) {
           const fnameSafe = (addr || "rapport").replace(/[^a-z0-9]+/gi, "_").slice(0, 60) || "rapport";
+          // Print-CSS: de rapport-HTML is een weblayout (max ~920px breed,
+          // kaarten en 3-koloms vergelijkingstabellen). Op A4-portret
+          // (794px @96dpi) knipt dat rechts af en splitten kaarten door
+          // de paginagrens. Vandaar: @page-marges, een zoom die de
+          // weblayout passend schaalt (920→718px op 192mm inclusief
+          // marges), break-inside: avoid voor kaarten/tabellen en
+          // breedte-vangnetten voor img/svg/table.
           const standalone = `<!doctype html><html lang="nl"><head><meta charset="utf-8"><title>Mid-rapport — ${escapeHtmlSimple(addr || "")}</title>
-<style>body{font-family:Arial,Helvetica,sans-serif;color:#0f172a;line-height:1.55;max-width:920px;margin:24px auto;padding:0 16px}</style>
-</head><body><h1>Mid-rapport</h1><p><b>Adres:</b> ${escapeHtmlSimple(addr || "")}</p><hr/>${rawHtml}</body></html>`;
+<style>
+@page { size: A4; margin: 10mm 9mm; }
+html, body { margin: 0; padding: 0; }
+body { font-family: Arial, Helvetica, sans-serif; color: #0f172a; line-height: 1.55; }
+.rapport { max-width: 920px; margin: 0 auto; zoom: 0.78; }
+.rapport table, .rapport tr, .rapport [class*="card"], .rapport [class*="Card"] { break-inside: avoid; }
+.rapport h1, .rapport h2, .rapport h3 { break-after: avoid; }
+.rapport thead { display: table-header-group; }
+.rapport img, .rapport svg { max-width: 100% !important; height: auto; }
+.rapport table { max-width: 100% !important; }
+.rapport * { overflow-wrap: break-word; }
+</style>
+</head><body><div class="rapport"><h1>Mid-rapport</h1><p><b>Adres:</b> ${escapeHtmlSimple(addr || "")}</p><hr/>${rawHtml}</div></body></html>`;
           try {
             const pdfBuffer = await htmlToPdfBuffer(standalone);
             attachments.push({ filename: `mid_rapport_${fnameSafe}.pdf`, content: pdfBuffer });
