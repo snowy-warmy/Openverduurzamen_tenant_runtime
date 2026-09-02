@@ -14,6 +14,15 @@
 #
 # The list of tenant repos comes from tenants.txt next to this script.
 # Add/remove lines to onboard or offboard.
+#
+# (sep 2026) De pin is een TARBALL-URL geworden:
+#   https://github.com/snowy-warmy/Openverduurzamen_tenant_runtime/archive/refs/tags/vX.Y.Z.tar.gz
+# Reden: Render's build herschrijft git+https-dependencies naar SSH en faalt
+# dan op "Permission denied (publickey)". Met de build-cache erbij leek de
+# deploy te slagen terwijl de OUDE runtime bleef draaien (lead-BCC-incident,
+# 2 sep 2026). Een tarball-URL installeert keyloos via HTTPS en is cache-proof:
+# elke tag is een unieke URL. De sed herkent zowel het oude git+https- als
+# het tarball-formaat en herschrijft beide naar de nieuwe tag.
 
 set -euo pipefail
 
@@ -22,6 +31,8 @@ if [ -z "$VERSION" ]; then
   echo "Usage: $0 <version-tag>   e.g. $0 v1.4.2" >&2
   exit 2
 fi
+
+TARBALL_URL="https://github.com/snowy-warmy/Openverduurzamen_tenant_runtime/archive/refs/tags/${VERSION}.tar.gz"
 
 TENANTS_FILE="$(dirname "$0")/tenants.txt"
 WORKDIR="${WORKDIR:-/tmp/of-fleet}"
@@ -39,7 +50,7 @@ while IFS= read -r repo; do
 
   echo ""
   echo "=== ${repo} ==="
-  REPO_DIR="${WORKDIR}/$(basename "$repo")"
+  REPO_DIR="${WORKDIR}/$(basename "$repo" .git)"
 
   if [ -d "$REPO_DIR" ]; then
     git -C "$REPO_DIR" fetch --quiet
@@ -51,14 +62,16 @@ while IFS= read -r repo; do
   fi
 
   # Update the runtime pin. We rely on a sentinel string in package.json:
-  # "@openverduurzamen/tenant-runtime": "git+https://github.com/snowy-warmy/Openverduurzamen_tenant_runtime.git#vX.Y.Z"
+  # "@openverduurzamen/tenant-runtime": "<waarde>"
+  # De waarde mag het oude git+https- of het tarball-formaat hebben — de
+  # sed vervangt wat er ook staat door de tarball-URL van deze versie.
   if ! grep -q '"@openverduurzamen/tenant-runtime"' "$REPO_DIR/package.json"; then
     echo "  ! no tenant-runtime dep in package.json; skipping"
     continue
   fi
 
   sed -i.bak -E \
-    "s|(\"@openverduurzamen/tenant-runtime\"\s*:\s*\"git\+https://github\.com/snowy-warmy/Openverduurzamen_tenant_runtime\.git#)v[0-9.]+\"|\\1${VERSION}\"|" \
+    "s|(\"@openverduurzamen/tenant-runtime\"\s*:\s*\")[^\"]*\"|\1${TARBALL_URL}\"|" \
     "$REPO_DIR/package.json"
   rm -f "$REPO_DIR/package.json.bak"
 

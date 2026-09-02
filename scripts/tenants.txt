@@ -1,3 +1,8 @@
 # One git URL per line. Add a new line per tenant. Comments with # ignored.
-git@github.com:OpenVerduurzamen/tenant-woonwijzerwinkel.git
-git@github.com:OpenVerduurzamen/tenant-huislijn.git
+# (sep 2026: juiste org + werkelijke reponamen; ssh-vorm weg — de script-host
+#  heeft geen GitHub-SSH-key, https clone werkt keyloos voor publieke repo's)
+https://github.com/snowy-warmy/tenant_woonwijzerwinkel.git
+https://github.com/snowy-warmy/tenant_huislijn.git
+https://github.com/snowy-warmy/tenant_der.git
+https://github.com/snowy-warmy/tenant_energieprestatie.git
+https://github.com/snowy-warmy/tenant_softbee.git
