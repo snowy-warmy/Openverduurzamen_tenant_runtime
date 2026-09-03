@@ -1433,8 +1433,11 @@ html, body { margin: 0; padding: 0; background: ${pageBg}; }
 .rapport .mid-report .mid-kerngegevens,
 .rapport .mid-report .mid-footer,
 .rapport .mid-report .mid-label-chip { box-shadow: none !important; }
-.rapport .mid-header, .rapport .mid-grid, .rapport .mid-kerngegevens,
-.rapport .mid-footer { break-inside: avoid; }
+/* CTA/bestelblok ("Bestel volledig rapport €30") hoort op de site,
+   niet in de lead-PDF naar de Woonwijzerwinkel. Bron- en disclaimer-
+   regels eronder blijven staan. */
+.rapport .mid-report .mid-footer { display: none !important; }
+.rapport .mid-header, .rapport .mid-grid, .rapport .mid-kerngegevens { break-inside: avoid; }
 .rapport h1, .rapport h2, .rapport h3 { break-after: avoid; }
 </style>
 </head><body><div class="rapport">${rawHtml}</div></body></html>`;
