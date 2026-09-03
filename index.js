@@ -1414,7 +1414,11 @@ html, body { margin: 0; padding: 0; background: ${pageBg}; }
 .rapport .mid-report .mid-mobile-stack { display: none !important; }
 .rapport .mid-report .mid-header { flex-direction: row !important; }
 .rapport .mid-report .mid-label-chip { min-width: 200px !important; display: block !important; }
-.rapport { width: 920px; zoom: 0.78; }
+/* Rapport vult exact de A4-breedte (794/920 = 0.863): volledige bleed,
+   geen achtergrondstrook naast het rapport (gaf een zichtbare naad
+   met schaduwcascade van de kaarten). Hoogte blijft ruim op één A4. */
+.rapport { width: 920px; zoom: 0.863; }
+.rapport .mid-report > * { max-width: 100% !important; }
 .rapport .mid-report {
   border-radius: 0 !important;
   border: 0 !important;
@@ -1422,6 +1426,13 @@ html, body { margin: 0; padding: 0; background: ${pageBg}; }
   box-shadow: none !important;
   box-sizing: border-box;
 }
+/* Schaduw van de grote sectie-kaarten uit in print: de gradient loopt
+   de paginarand in en mengt daar met de achtergrondkleur (de
+   "overlappende grijze vlakken"). Rand + radius blijven staan. */
+.rapport .mid-report .mid-grid,
+.rapport .mid-report .mid-kerngegevens,
+.rapport .mid-report .mid-footer,
+.rapport .mid-report .mid-label-chip { box-shadow: none !important; }
 .rapport .mid-header, .rapport .mid-grid, .rapport .mid-kerngegevens,
 .rapport .mid-footer { break-inside: avoid; }
 .rapport h1, .rapport h2, .rapport h3 { break-after: avoid; }
