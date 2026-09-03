@@ -1388,7 +1388,7 @@ export function createTenantApp(config) {
           const fnameSafe = (addr || "rapport").replace(/[^a-z0-9]+/gi, "_").slice(0, 60) || "rapport";
           // Print-CSS: het rapport-HTML uit de engine is self-contained
           // (inline styles + eigen <style>) en toont op de site de desktop-
-          // tabel. De PDF-wrapper herstylt dus NIET meer, maar schaalt het
+          // tabel. De PDF-wrapper herstylt dus NIET, maar schaalt het
           // 920px-webontwerp alleen uniform (zoom 0.78) naar A4-content-
           // breedte — look, fonts en verhoudingen blijven 1-op-1 staan.
           // Belangrijk: de print-viewport volgt de papierbreedte (~726px),
@@ -1396,17 +1396,32 @@ export function createTenantApp(config) {
           // hoge mobiele stapel schakelt. De .rapport .mid-report ...-
           // regels hieronder forceren de desktop-variant met hogere
           // specificiteit (0.3.0), ongeacht viewport van de renderer.
-          // Kalibratie: volledig rapport op één A4 (gekALIBREERD met een
-          // echt 6223AX-24 rapport via lokale Chromium-print, sep 2026).
+          // Full-bleed: op de site is het rapport een kaart-op-grijze-
+          // pagina; in de PDF IS de pagina het rapport — de eigen
+          // achtergrondkleur (uit het rapport-HTML gelezen, tenant-
+          // onafhankelijk) loopt door tot de paginarand, het kaart-
+          // omhulsel (radius/rand/schaduw) vervalt en de padding wordt
+          // de paginamarge. Binnenkaarten behouden alles.
+          // Kalibratie: volledig rapport op één A4 (echt 6223AX-24
+          // rapport via lokale Chromium-print, sep 2026).
+          const pageBgMatch = rawHtml.match(/class="mid-report"[^>]*style="[^"]*background:\s*(#[0-9a-fA-F]{3,8})/);
+          const pageBg = pageBgMatch ? pageBgMatch[1] : "#fafbfc";
           const standalone = `<!doctype html><html lang="nl"><head><meta charset="utf-8"><title>Mid-rapport — ${escapeHtmlSimple(addr || "")}</title>
 <style>
-@page { size: A4; margin: 10mm 9mm 12mm; }
-html, body { margin: 0; padding: 0; background: #fff; }
+@page { size: A4; margin: 0; }
+html, body { margin: 0; padding: 0; background: ${pageBg}; }
 .rapport .mid-report .mid-grid { display: grid !important; }
 .rapport .mid-report .mid-mobile-stack { display: none !important; }
 .rapport .mid-report .mid-header { flex-direction: row !important; }
 .rapport .mid-report .mid-label-chip { min-width: 200px !important; display: block !important; }
 .rapport { width: 920px; zoom: 0.78; }
+.rapport .mid-report {
+  border-radius: 0 !important;
+  border: 0 !important;
+  padding: 26px 30px !important;
+  box-shadow: none !important;
+  box-sizing: border-box;
+}
 .rapport .mid-header, .rapport .mid-grid, .rapport .mid-kerngegevens,
 .rapport .mid-footer { break-inside: avoid; }
 .rapport h1, .rapport h2, .rapport h3 { break-after: avoid; }
