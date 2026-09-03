@@ -1394,7 +1394,7 @@ export function createTenantApp(config) {
           // kaarten heel houden. Geen afgeknipte kolommen meer en een
           // goed gevulde pagina-indeling (gekalibreerd op de box met een
           // echt rapport, sep 2026).
-          const standalone = `<!doctype html><html lang="nl"><head><meta charset="utf-8"><title>Mid-rapport — \${escapeHtmlSimple(addr || "")}</title>
+          const standalone = `<!doctype html><html lang="nl"><head><meta charset="utf-8"><title>Mid-rapport — ${escapeHtmlSimple(addr || "")}</title>
 <style>
 @page { size: A4; margin: 10mm 9mm; }
 html, body { margin: 0; padding: 0; }
@@ -1418,7 +1418,7 @@ body { font-family: 'DM Sans','Inter',Arial,Helvetica,sans-serif; color: #0f172a
 .rapport h1, .rapport h2, .rapport h3, .rapport .mid-headline { break-after: avoid; }
 .rapport img, .rapport svg { max-width: 100% !important; height: auto; }
 </style>
-</head><body><div class="rapport"><div style="margin-bottom:8px"><h1 style="font-size:19px;margin:0 0 2px 0">Mid-rapport</h1><p style="margin:0;color:#64748b"><b style="color:#0f172a">Adres:</b> \${escapeHtmlSimple(addr || "")}</p></div>\${rawHtml}</div></body></html>`;
+</head><body><div class="rapport"><div style="margin-bottom:8px"><h1 style="font-size:19px;margin:0 0 2px 0">Mid-rapport</h1><p style="margin:0;color:#64748b"><b style="color:#0f172a">Adres:</b> ${escapeHtmlSimple(addr || "")}</p></div>${rawHtml}</div></body></html>`;
           try {
             const pdfBuffer = await htmlToPdfBuffer(standalone);
             attachments.push({ filename: `mid_rapport_${fnameSafe}.pdf`, content: pdfBuffer });
