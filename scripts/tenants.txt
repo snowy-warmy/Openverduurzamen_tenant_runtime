@@ -4,5 +4,9 @@
 https://github.com/snowy-warmy/tenant_woonwijzerwinkel.git
 https://github.com/snowy-warmy/tenant_huislijn.git
 https://github.com/snowy-warmy/tenant_der.git
-https://github.com/snowy-warmy/tenant_energieprestatie.git
-https://github.com/snowy-warmy/tenant_softbee.git
+# (10 sep 2026) Onderstaande twee repo's zijn niet bereikbaar — `git ls-remote`
+# geeft "repository not found" met credentials die de andere drie wel openen.
+# Uitgecommentarieerd zodat een fleet-bump niet halverwege afbreekt. Zet ze
+# terug zodra de repo's bestaan (of corrigeer de naam).
+# https://github.com/snowy-warmy/tenant_energieprestatie.git
+# https://github.com/snowy-warmy/tenant_softbee.git
