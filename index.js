@@ -33,7 +33,7 @@ import {
 } from "./lib/orders_store.js";
 import { createMolliePayment, getMolliePayment } from "./lib/mollie_client.js";
 import { htmlToPdfBuffer } from "./lib/pdfbolt_client.js";
-import { sendReportEmail, sendLeadEmail } from "./lib/mail_client.js";
+import { sendReportEmail, sendLeadEmail, sendOrderAlertEmail, orderAlertsEnabled } from "./lib/mail_client.js";
 import { initPrefillStore, createPrefillSession, getPrefillSession } from "./lib/prefill_store.js";
 import { initFeedbackStore, appendFeedback, listFeedback, feedbackStats } from "./lib/feedback_store.js";
 import {
@@ -555,6 +555,16 @@ export function createTenantApp(config) {
       },
     });
 
+    // Zonder betaalstap is dit het enige moment waarop iemand kan zien dat
+    // er een aanvraag loopt. Opt-in via ORDER_ALERT_ADDRESSES.
+    if (orderAlertsEnabled()) {
+      sendOrderAlertEmail({
+        kind: "requested",
+        order: getOrderById(orderId) || { id: orderId, address, email },
+        config,
+      }).catch(() => {});
+    }
+
     triggerBackgroundProcessing(orderId);
 
     return {
@@ -749,6 +759,17 @@ export function createTenantApp(config) {
         error: e?.message || String(e),
       });
       appendStep(orderId, e?.context?.step ? `${e.context.step}_failed` : "error", { message: e?.message || String(e) });
+      // Operationele alert (opt-in via ORDER_ALERT_ADDRESSES). Bewust
+      // fire-and-forget: een mislukte alert mag de foutafhandeling niet
+      // overschrijven, en de order is hierboven al bijgewerkt.
+      if (orderAlertsEnabled()) {
+        sendOrderAlertEmail({
+          kind: "failed",
+          order: getOrderById(orderId) || { id: orderId },
+          config,
+          extra: { error: e?.message || String(e), step: e?.context?.step || current?.last_step || "error" },
+        }).catch(() => {});
+      }
       throw e;
     }
   }

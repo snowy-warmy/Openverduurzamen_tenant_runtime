@@ -1,1 +1,7 @@
 node_modules/
+
+# Nooit sleutels of lokale omgevingsbestanden meecommitten
+.env
+.env.*
+*.key
+.altum-api-key
