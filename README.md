@@ -51,9 +51,21 @@ The script clones each tenant repo, bumps the runtime pin in its `package.json`,
   mail:     { fromAddress, subjectTemplate, signOff, bodyIntro, contactLine },
   payment:  { priceEur, description },
   prompts:  { systemRoleOverlay, adviceOverlay },
-  reportApi:{ renderUrl, lookupUrl }
+  reportApi:{ renderUrl, lookupUrl },
+  report:   { fullReportAccess, midFocus[], labelFloor, labelScenarios[] }  // optioneel
 }
 ```
+
+`report` is het rapportprofiel dat naar de report-api gaat: `fullReportAccess`
+(`"paid"` of `"included"`), `midFocus` (waar het snelle rapport over gaat),
+`labelFloor` (geen advies onder dit label) en `labelScenarios` (de doellabels
+van de scenario's). Laat het weg en de report-api gebruikt zijn defaults —
+dan blijft het rapport exact zoals het was.
+
+Voeg je hier een veld toe, voeg het dan óók toe aan `buildBrandPayload()` in
+`index.js`. Die functie somt handmatig op wat de report-api meekrijgt: een
+veld dat daar ontbreekt bereikt de renderer nooit, zonder dat er iets faalt.
+`test/brand_payload.test.js` dekt dit af.
 
 See `tenant-woonwijzerwinkel/tenant.config.js` for a fully-populated example.
 

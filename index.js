@@ -347,6 +347,13 @@ export function createTenantApp(config) {
       followUp: config.followUp || { enabled: false },
       product: { name: config.product?.name || "Volledig Verduurzamingsinzicht", fullReportUrl: config.product?.fullReportUrl || "" },
       prompts: config.prompts || {},
+      // Rapportregels van de tenant (doellabels, focus, of het volledige
+      // rapport in de dienstverlening zit). Zonder dit veld leest de
+      // report-api zijn eigen defaults en blijft een tenant-specifiek
+      // rapportprofiel onzichtbaar: de config stond dan wel in de tenant,
+      // maar bereikte de renderer nooit. Tenants zonder `report` sturen een
+      // leeg object en houden exact het oude gedrag.
+      report: config.report || {},
     };
   }
 
@@ -618,9 +625,14 @@ export function createTenantApp(config) {
   // retention even if the 24h timer never fires.
   function scheduleCleanup() {
     try { cleanupExpiredPdfs(); } catch (err) { console.error("cleanup error", err); }
+    // unref(): in een draaiende tenant houdt de luisterende HTTP-server het
+    // proces in leven, dus deze opruiming loopt gewoon door. Zonder unref
+    // houdt de timer het event-loop óók bezig als er geen server luistert —
+    // dan eindigt een proces dat alleen createTenantApp() aanroept nooit,
+    // en blijft een testrun na de laatste assertie hangen.
     setInterval(() => {
       try { cleanupExpiredPdfs(); } catch (err) { console.error("cleanup error", err); }
-    }, 24 * 60 * 60 * 1000);
+    }, 24 * 60 * 60 * 1000).unref();
   }
 
   async function processOrderById(orderId) {
@@ -1478,9 +1490,12 @@ export function createTenantApp(config) {
 
   // Boot-time: run a recovery sweep + schedule periodic sweeps for any
   // orders that got stuck mid-flight (Render restart, network blip, etc.).
-  setTimeout(() => recoverPendingOrders().catch(() => {}), 1000);
+  // unref() op beide, om dezelfde reden als bij scheduleCleanup(): de sweeps
+  // blijven in productie lopen zolang de server luistert, maar houden een
+  // proces zonder server niet kunstmatig in leven.
+  setTimeout(() => recoverPendingOrders().catch(() => {}), 1000).unref();
   const intervalMs = Number(process.env.RETRY_INTERVAL_MS || 60000);
-  setInterval(() => { recoverPendingOrders().catch(() => {}); }, intervalMs);
+  setInterval(() => { recoverPendingOrders().catch(() => {}); }, intervalMs).unref();
 
   // PDF retention cleanup runs daily (and once on boot). Set
   // PDF_RETENTION_DAYS=0 to disable. Default 365.
