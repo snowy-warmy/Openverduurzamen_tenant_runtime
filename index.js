@@ -33,6 +33,7 @@ import {
 } from "./lib/orders_store.js";
 import { createMolliePayment, getMolliePayment } from "./lib/mollie_client.js";
 import { htmlToPdfBuffer } from "./lib/pdfbolt_client.js";
+import { adviesAanvraagMail, losRapportHtml } from "./lib/advies_aanvraag.js";
 import { sendReportEmail, sendLeadEmail } from "./lib/mail_client.js";
 import { initPrefillStore, createPrefillSession, getPrefillSession } from "./lib/prefill_store.js";
 import {
@@ -1386,6 +1387,8 @@ export function createTenantApp(config) {
       const ctxIn = (body.context && typeof body.context === "object") ? body.context : {};
       let reportContext = null;
       const attachments = [];
+      // Ontvanger en teksten voor een adviesaanvraag (zie lib/advies_aanvraag.js).
+      let mailOverrides = null;
 
       // Localisation maps for confirmed_data values (same source-of-truth as
       // full_start.html's OPTIONS so the email is readable for WWW staff).
@@ -1427,6 +1430,36 @@ export function createTenantApp(config) {
       // ----- mid_report path -----
       // Client sends: { productType:"mid_report", address, confirmedData,
       //                 reportHtml (capped at ~1MB) }
+      // ----- advies_aanvraag path -----
+      // Vrijblijvend advies van de partner vanuit het snelle rapport. Zelfde
+      // context als mid_report; het rapport gaat als pdf mee (of als html
+      // als de pdf niet lukt) naar config.adviceRequest.recipient.
+      if (ctxIn.productType === "advies_aanvraag") {
+        const addr = formatAddress(ctxIn.address);
+        const mail = adviesAanvraagMail({ config, firstName, lastName, adres: addr });
+        if (mail) {
+          mailOverrides = mail;
+          const rows = [];
+          if (addr) rows.push(["Adres", addr]);
+          rows.push(...humanizeConfirmed(ctxIn.confirmedData));
+          reportContext = { title: "Gegevens uit het snelle rapport", rows };
+
+          const rawHtml = typeof ctxIn.reportHtml === "string" ? ctxIn.reportHtml : "";
+          if (rawHtml && rawHtml.length < 1_500_000) {
+            const fnameSafe = (addr || "rapport").replace(/[^a-z0-9]+/gi, "_").slice(0, 60) || "rapport";
+            const los = losRapportHtml({ adres: addr, rapportHtml: rawHtml, tenantNaam: config?.brand?.name });
+            try {
+              const pdf = await htmlToPdfBuffer(los);
+              attachments.push({ filename: `snel_rapport_${fnameSafe}.pdf`, content: pdf });
+            } catch (e) {
+              // eslint-disable-next-line no-console
+              console.warn("[lead] pdf van snel rapport mislukt, html als bijlage:", e?.message || e);
+              attachments.push({ filename: `snel_rapport_${fnameSafe}.html`, content: Buffer.from(los, "utf8") });
+            }
+          }
+        }
+      }
+
       if (ctxIn.productType === "mid_report") {
         const rows = [];
         const addr = formatAddress(ctxIn.address);
@@ -1511,6 +1544,9 @@ export function createTenantApp(config) {
         config,
         reportContext,
         attachments,
+        ...(mailOverrides
+          ? { to: mailOverrides.to, subject: mailOverrides.subject, heading: mailOverrides.heading, intro: mailOverrides.intro }
+          : {}),
         meta: {
           ip,
           userAgent: String(req.headers["user-agent"] || "").slice(0, 200),
