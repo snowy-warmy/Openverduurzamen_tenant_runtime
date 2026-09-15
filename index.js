@@ -1078,6 +1078,33 @@ export function createTenantApp(config) {
   // (same-origin), not by a server.
   app.post("/api/mid/full-report-handoff", handleMidHandoff);
 
+  // Advertentietekst uitlezen. De adviseur plakt de tekst van een
+  // woningadvertentie; de report-api haalt er maatregelen, installaties en het
+  // aantal zonnepanelen uit. De runtime geeft alleen door, met de tenant erbij:
+  // de report-api beslist of deze tenant dit mag (rapportprofiel).
+  app.post("/api/mid/listing-extract", async (req, res) => {
+    const renderUrl = getReportRenderUrl();
+    if (!renderUrl) return res.status(500).json({ error: "FULL_APP_RENDER_URL ontbreekt." });
+    const upstream = renderUrl.replace(/\/api\/full\/render$/i, "/api/mid/listing-extract");
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), Number(process.env.FULL_APP_LISTING_TIMEOUT_MS || 90000));
+    try {
+      const r = await undiciFetch(upstream, {
+        method: "POST",
+        headers: buildReportApiHeaders(),
+        body: JSON.stringify({ tekst: String(req.body?.tekst ?? ""), tenant: buildBrandPayload() }),
+        signal: ac.signal,
+        dispatcher: longFetchAgent,
+      });
+      const json = await r.json().catch(() => null);
+      return res.status(r.status).json(json || { error: "Onverwacht antwoord bij het lezen van de advertentie." });
+    } catch {
+      return res.status(502).json({ error: "De advertentietekst kon niet worden verwerkt. Probeer het opnieuw." });
+    } finally {
+      clearTimeout(t);
+    }
+  });
+
   // Mid handoff config — old Mid frontend hits this on init to learn
   // where to send the user. In the merged tenant world, the answer is
   // always "this very server", so we return self-referential URLs.
